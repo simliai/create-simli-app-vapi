@@ -347,11 +347,12 @@ export default function SimliVapi({ onStart, onClose }: { onStart: () => void; o
 
     try {
       // 1. Simli first: the avatar must be on screen before the assistant speaks.
-      const tokenRes = await fetch("/api/simli-token", { method: "POST" });
+      const tokenRes = await fetch("/api/simli-token", { method: "POST", signal: AbortSignal.timeout(15_000) });
       if (!tokenRes.ok) {
         throw new Error(explainSimliError(`Simli token route failed (${tokenRes.status}): ${await errorText(tokenRes)}`));
       }
-      const { session_token } = (await tokenRes.json()) as { session_token: string };
+      const { session_token } = (await tokenRes.json().catch(() => ({}))) as { session_token?: string };
+      if (!session_token) throw new Error("The token route returned no session token.");
 
       const simli = new SimliClient(session_token, videoRef.current, audioRef.current, null, LogLevel.ERROR);
       simliRef.current = simli;
@@ -394,9 +395,16 @@ export default function SimliVapi({ onStart, onClose }: { onStart: () => void; o
       });
 
       const call = await vapi.start(VAPI_ASSISTANT_ID);
-      if (sessionRef.current !== session) return; // stopped while starting
+      if (sessionRef.current !== session) {
+        // Ended while start() was in flight. In @vapi-ai/web 3.1, a stop() issued
+        // before the call object exists doesn't cancel the join, so the call (and
+        // the mic) would stay up: stop it again now that it exists.
+        void vapi.stop().catch(() => {});
+        return;
+      }
       if (!call) {
         // start() resolves null on failure; the "error" handler normally reports why.
+        void vapi.stop().catch(() => {});
         end("Vapi could not start the call. Check the assistant ID and public key.");
         return;
       }
