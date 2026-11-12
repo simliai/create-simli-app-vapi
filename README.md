@@ -1,3 +1,8 @@
+> [!WARNING]
+> **This repository is archived.** It was built for an earlier version of the Simli API and SDK, and is no longer maintained or guaranteed to work. Some of its code puts API keys in the browser, so don't deploy it.
+>
+> Start from a current starter instead: [all Simli starters](https://docs.simli.com/api-reference/samples/all-samples) (LiveKit Agents, Pipecat, ElevenLabs, OpenAI Realtime, Vapi). Or give your coding agent Simli in one command: `npx skills add simliai/skills`.
+
 # Create Simli App (Vapi)
 This starter is an example of how to create a composable Simli interaction that runs in a Next.js app.
 
