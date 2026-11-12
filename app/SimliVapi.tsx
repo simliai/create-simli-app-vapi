@@ -1,431 +1,462 @@
-import React, { use, useCallback, useEffect, useRef, useState } from "react";
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
 import Vapi from "@vapi-ai/web";
-import { generateIceServers, generateSimliSessionToken, LogLevel, SimliClient } from "simli-client";
+import { LogLevel, SimliClient } from "simli-client";
 import VideoBox from "./Components/VideoBox";
 import cn from "./utils/TailwindMergeAndClsx";
 import IconSparkleLoader from "@/media/IconSparkleLoader";
 
-interface SimliVapiProps {
-    simli_faceid: string;
-    agentId: string; // Vapi agent ID
-    onStart: () => void;
-    onClose: () => void;
-    showDottedFace: boolean;
+// Vapi's PUBLIC key is designed to be used in the browser. Never put the
+// private key here: it can access your whole Vapi organization.
+const VAPI_PUBLIC_KEY = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY?.trim() ?? "";
+const VAPI_ASSISTANT_ID = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID?.trim() ?? "";
+
+// --- Audio routing ----------------------------------------------------------
+// Simli takes PCM16 little-endian mono @ 16 kHz. We tap Vapi's assistant track
+// with an AudioContext running at 16 kHz, so the browser resamples for us.
+//
+// Why buffer instead of client.listenToMediastreamTrack(track)? Streaming the
+// live track gave noticeably worse lip-sync, so audio is gated on Vapi's
+// speech-start / speech-end events and sent in buffered chunks:
+//   1. the first INITIAL_BUFFER_SAMPLES of an utterance go out at once with
+//      sendAudioDataImmediate, so Simli starts with a full second of context;
+//   2. the rest follows in CHUNK_SAMPLES-sized sendAudioData calls;
+//   3. whatever is left is flushed shortly after speech-end.
+// Because audio arrives in bursts, the token route sets handleSilence: true.
+// Trade-off: about 1 s of extra latency before the avatar starts talking.
+const SAMPLE_RATE = 16000;
+const INITIAL_BUFFER_SAMPLES = SAMPLE_RATE; // 1 s
+const CHUNK_SAMPLES = 4800; // 300 ms (9600 bytes)
+// Vapi fires speech-start on the first loud audio frame (its level observer
+// runs every 100 ms), so keep a little audio from before it to avoid clipping
+// the first syllable. Only Simli's audio is heard, so dropped audio is lost.
+const PREROLL_SAMPLES = 4800; // 300 ms
+// Vapi fires speech-end ~1 s after the last loud frame; keep the gate open a
+// little longer to catch trailing audio.
+const SPEECH_END_GRACE_MS = 500;
+
+// Converts Float32 frames to PCM16 and posts ~40 ms chunks to the main thread.
+const TAP_WORKLET = `
+class VapiTap extends AudioWorkletProcessor {
+  constructor() { super(); this.buf = new Int16Array(640); this.n = 0; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) {
+      for (let i = 0; i < ch.length; i++) {
+        const s = Math.max(-1, Math.min(1, ch[i]));
+        this.buf[this.n++] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
+        if (this.n === this.buf.length) { this.port.postMessage(this.buf.slice(0)); this.n = 0; }
+      }
+    }
+    return true;
+  }
 }
+registerProcessor("vapi-tap", VapiTap);
+`;
 
-const vapi = new Vapi(process.env.NEXT_PUBLIC_VAPI_API_KEY as string);
-let simliClient: SimliClient | null = null
+// Vapi errors that don't end the call.
+const NON_FATAL_VAPI_ERRORS = new Set([
+  "audio-observer-setup-error",
+  "audio-processing-setup-error",
+  "audio-processor-recovery-error",
+  "audio-start-failed", // Vapi's own player failed; we read the track from Daily instead
+]);
 
-// Audio constants. Simli expects PCM16 little-endian mono @ 16kHz.
-const SIMLI_SAMPLE_RATE = 16000;
-// Chunk size (in samples) sent to SimliClient.sendAudioData — must match the
-// audioBufferSize passed as the last SimliClient constructor argument.
-const SIMLI_AUDIO_BUFFER_SIZE = 4800;
-// On speech-start we buffer 1 second before the initial immediate playback.
-const INITIAL_BUFFER_SAMPLES = SIMLI_SAMPLE_RATE; // 1 second @ 16kHz
-const SimliVapi: React.FC<SimliVapiProps> = ({
-    simli_faceid,
-    agentId,
-    onStart,
-    onClose,
-    showDottedFace,
-}) => {
-    // State management
-    const [isLoading, setIsLoading] = useState(false);
-    const [isAvatarVisible, setIsAvatarVisible] = useState(false);
-    const [error, setError] = useState("");
-    const doRunOnce = useRef(false);
+type Status = "idle" | "starting" | "live";
 
-    // Refs for media elements
-    const videoRef = useRef<HTMLVideoElement>(null);
-    const audioRef = useRef<HTMLAudioElement>(null);
-
-    // Refs for capturing/processing the Vapi assistant audio track
-    const audioContextRef = useRef<AudioContext | null>(null);
-    const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
-    const processorRef = useRef<ScriptProcessorNode | null>(null);
-    const mediaStreamRef = useRef<MediaStream | null>(null);
-
-    // Buffering state. We only accumulate audio while the assistant is speaking.
-    const pcmBufferRef = useRef<Int16Array>(new Int16Array(0));
-    const isAssistantSpeakingRef = useRef(false);
-    const initialChunkSentRef = useRef(false);
-    // Keeps the gate open for a short grace period after speech-end.
-    const speechEndTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-    /**
-     * Handles the start of the interaction
-     */
-    const handleStart = useCallback(async () => {
-        setIsLoading(true);
-        setError("");
-        onStart();
-
-        try {
-            initializeSimliClient();
-
-            // Request microphone access
-            await navigator.mediaDevices.getUserMedia({ audio: true });
-
-        } catch (error: any) {
-            console.error("Error starting interaction:", error);
-            setError(`Error starting interaction: ${error.message}`);
-            setIsLoading(false);
-        }
-    }, [agentId, onStart]);
-
-    /**
-     * Handles stopping the interaction
-     */
-    const handleStop = useCallback(() => {
-        console.log("Stopping interaction...");
-        setIsLoading(false);
-        setError("");
-        setIsAvatarVisible(false);
-
-        // Remove Vapi listeners so a restart doesn't stack duplicate handlers
-        // (which would attach a second audio pipeline sharing the same buffer).
-        vapi.removeAllListeners();
-
-        // Tear down the audio capture pipeline
-        if (speechEndTimeoutRef.current) {
-            clearTimeout(speechEndTimeoutRef.current);
-            speechEndTimeoutRef.current = null;
-        }
-        isAssistantSpeakingRef.current = false;
-        pcmBufferRef.current = new Int16Array(0);
-        processorRef.current?.disconnect();
-        sourceNodeRef.current?.disconnect();
-        processorRef.current = null;
-        sourceNodeRef.current = null;
-        mediaStreamRef.current = null;
-        if (audioContextRef.current && audioContextRef.current.state !== "closed") {
-            audioContextRef.current.close();
-        }
-        audioContextRef.current = null;
-
-        // Clean up Simli client
-        simliClient?.stop();
-
-        onClose();
-        console.log("Interaction stopped");
-    }, [onClose]);
-
-    /**
-     * Initializes the Simli client with the provided configuration.
-     */
-    const initializeSimliClient = useCallback(async () => {
-        if (videoRef.current && audioRef.current) {
-            const SimliConfig = {
-                faceId: simli_faceid,
-                handleSilence: true,
-                maxSessionLength: 600,
-                maxIdleTime: 600,
-            };
-
-            simliClient = new SimliClient((
-                await generateSimliSessionToken(
-                    { apiKey: (process.env.NEXT_PUBLIC_SIMLI_API_KEY as string), config: SimliConfig },
-                )).session_token,
-                videoRef.current,
-                audioRef.current,
-                await generateIceServers(
-                    (process.env.NEXT_PUBLIC_SIMLI_API_KEY as string),
-
-                ),
-                LogLevel.DEBUG,
-                "livekit",
-                'websockets',
-                'wss://api.simli.ai',
-                SIMLI_AUDIO_BUFFER_SIZE,
-            )
-            simliClient?.on("start", () => {
-                console.log("SimliClient connected");
-                const audioData = new Uint8Array(6000).fill(0);
-                simliClient?.sendAudioData(audioData);
-                // Start Vapi interaction
-                startVapiInteraction();
-                console.log("Sent initial audio data");
-            });
-
-            simliClient?.on("stop", () => {
-                console.log("SimliClient disconnected");
-                vapi.stop();
-            });
-            simliClient?.on("error", (_) => {
-                console.log("SimliClient errored");
-                vapi.stop();
-            });
-
-            simliClient?.on("startup_error", (_) => {
-                console.log("SimliClient Failed To Start");
-                vapi.stop();
-            });
-            await simliClient.start()
-
-        }
-
-    }, [simli_faceid]);
-
-    /**
-     * Start Vapi interaction
-     */
-    const startVapiInteraction = async () => {
-        try {
-            await vapi.start(agentId);
-            console.log("Vapi interaction started");
-            eventListenerVapi();
-        } catch (error: any) {
-            console.error("Error starting Vapi interaction:", error);
-            setError(`Error starting Vapi interaction: ${error.message}`);
-        }
-    };
-
-    /**
-     * Mute Vapi internal audio and only keep simli's audio
-     */
-    const muteVapiInternalAudio = () => {
-        const audioElements = document.getElementsByTagName("audio");
-        for (let i = 0; i < audioElements.length; i++) {
-            if (audioElements[i].id !== "simli_audio") {
-                audioElements[i].muted = true;
-            }
-        }
-    };
-
-    /**
-     * Locate the "Vapi Speaker" assistant audio track and start processing it.
-     * Retries until the participant/track actually exists (it may not be present
-     * yet at call-start) rather than doing a single-shot scan.
-     */
-    const getAudioElementAndSendToSimli = () => {
-        if (!simliClient) {
-            setTimeout(getAudioElementAndSendToSimli, 100);
-            return;
-        }
-        muteVapiInternalAudio();
-        try {
-            const dailyCall = vapi.getDailyCallObject();
-            const participants = dailyCall?.participants();
-            let vapiAudioTrack: MediaStreamTrack | null = null;
-            if (participants) {
-                Object.values(participants).forEach((participant: any) => {
-                    if (participant.user_name === "Vapi Speaker") {
-                        vapiAudioTrack = participant.tracks?.audio?.track ?? null;
-                    }
-                });
-            }
-
-            if (vapiAudioTrack) {
-                console.log("Vapi Speaker detected, setting up audio processing");
-                setupAudioProcessing(vapiAudioTrack);
-            } else {
-                // Track not ready yet — keep polling.
-                setTimeout(getAudioElementAndSendToSimli, 100);
-            }
-        } catch (error: any) {
-            console.error("Error getting audio track:", error);
-            setTimeout(getAudioElementAndSendToSimli, 100);
-        }
-    };
-
-    /**
-     * Sets up a Web Audio pipeline on the assistant's audio track. The capture
-     * AudioContext runs at 16kHz, so the MediaStreamSource is auto-resampled and
-     * we get 16kHz mono samples directly — no manual downsampling needed.
-     */
-    const setupAudioProcessing = (audioTrack: MediaStreamTrack) => {
-        const audioContext = new AudioContext({ sampleRate: SIMLI_SAMPLE_RATE });
-        audioContextRef.current = audioContext;
-
-        const mediaStream = new MediaStream([audioTrack]);
-        mediaStreamRef.current = mediaStream;
-
-        const source = audioContext.createMediaStreamSource(mediaStream);
-        sourceNodeRef.current = source;
-
-        const processor = audioContext.createScriptProcessor(2048, 1, 1);
-        processorRef.current = processor;
-
-        processor.onaudioprocess = (e) => {
-            // Only buffer/forward audio while the assistant is actually speaking.
-            if (!isAssistantSpeakingRef.current || !simliClient) return;
-
-            const inputData = e.inputBuffer.getChannelData(0);
-            const samples = new Int16Array(inputData.length);
-            for (let i = 0; i < inputData.length; i++) {
-                const s = Math.max(-1, Math.min(1, inputData[i]));
-                samples[i] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
-            }
-            processAudioForSimli(samples);
-        };
-
-        source.connect(processor);
-        // ScriptProcessor must be connected to keep firing; it writes no output,
-        // so this routes silence to the speakers (Simli plays the real audio).
-        processor.connect(audioContext.destination);
-    };
-
-    /**
-     * Appends new 16kHz PCM16 samples and forwards them to Simli following the
-     * "1 second immediate, then fixed-size chunks" scheme.
-     */
-    const processAudioForSimli = (samples: Int16Array) => {
-        if (!simliClient) return;
-
-        const merged = new Int16Array(pcmBufferRef.current.length + samples.length);
-        merged.set(pcmBufferRef.current, 0);
-        merged.set(samples, pcmBufferRef.current.length);
-        pcmBufferRef.current = merged;
-
-        // Phase 1: buffer the first ~1 second of the utterance, then play it
-        // immediately to minimize startup latency.
-        if (!initialChunkSentRef.current) {
-            if (pcmBufferRef.current.length < INITIAL_BUFFER_SAMPLES) {
-                return; // keep buffering until we have 1 second
-            }
-            const initial = pcmBufferRef.current.slice(0, INITIAL_BUFFER_SAMPLES);
-            pcmBufferRef.current = pcmBufferRef.current.slice(INITIAL_BUFFER_SAMPLES);
-            simliClient.sendAudioDataImmediate(new Uint8Array(initial.buffer));
-            initialChunkSentRef.current = true;
-        }
-
-        // Phase 2: forward the rest in SIMLI_AUDIO_BUFFER_SIZE-sample chunks.
-        while (pcmBufferRef.current.length >= SIMLI_AUDIO_BUFFER_SIZE) {
-            const chunk = pcmBufferRef.current.slice(0, SIMLI_AUDIO_BUFFER_SIZE);
-            pcmBufferRef.current = pcmBufferRef.current.slice(SIMLI_AUDIO_BUFFER_SIZE);
-            simliClient.sendAudioData(new Uint8Array(chunk.buffer));
-        }
-    };
-
-    /**
-     * Flushes whatever audio remains when the assistant stops speaking, so we
-     * don't drop sub-1-second utterances or clip the tail of a chunk.
-     */
-    const flushRemainingBuffer = () => {
-        if (!simliClient || pcmBufferRef.current.length === 0) {
-            pcmBufferRef.current = new Int16Array(0);
-            return;
-        }
-        const remaining = pcmBufferRef.current;
-        if (!initialChunkSentRef.current) {
-            // Utterance was shorter than 1s — still play it immediately.
-            simliClient.sendAudioDataImmediate(new Uint8Array(remaining.buffer));
-            initialChunkSentRef.current = true;
-        } else {
-            simliClient.sendAudioData(new Uint8Array(remaining.buffer));
-        }
-        pcmBufferRef.current = new Int16Array(0);
-    };
-
-    /**
-     * Vapi Event listeners
-     */
-    const eventListenerVapi = useCallback(() => {
-        vapi.on("message", (message) => {
-            console.log("Vapi message:", message);
-            if (
-                message.type === "speech-update" &&
-                message.status === "started" &&
-                message.role === "user"
-            ) {
-                console.log("User started speaking");
-                // simliClient?.ClearBuffer();
-            }
-        });
-
-        vapi.on("call-start", () => {
-            console.log("Vapi call started");
-            setIsAvatarVisible(true);
-            getAudioElementAndSendToSimli();
-        });
-
-        vapi.on("call-end", () => {
-            console.log("Vapi call ended");
-            setIsAvatarVisible(false);
-        });
-
-        // Assistant started speaking — open the gate. Audio is only ever sent
-        // within [speech-start, speech-end + 0.5s].
-        vapi.on("speech-start", () => {
-            // Cancel any pending close from a previous speech-end.
-            if (speechEndTimeoutRef.current) {
-                clearTimeout(speechEndTimeoutRef.current);
-                speechEndTimeoutRef.current = null;
-            }
-            if (!isAssistantSpeakingRef.current) {
-                // Genuinely new utterance — buffer fresh.
-                console.log("Assistant speech started — buffering");
-                pcmBufferRef.current = new Int16Array(0);
-                initialChunkSentRef.current = false;
-                isAssistantSpeakingRef.current = true;
-            } else {
-                // Re-detected within the trailing grace window — continue.
-                console.log("Assistant speech resumed within grace window");
-            }
-        });
-
-        // Assistant stopped speaking — keep the gate open 0.5s more to catch
-        // trailing audio, then close it and flush whatever remains.
-        vapi.on("speech-end", () => {
-            console.log("Assistant speech ended — closing gate in 0.5s");
-            if (speechEndTimeoutRef.current) {
-                clearTimeout(speechEndTimeoutRef.current);
-            }
-            speechEndTimeoutRef.current = setTimeout(() => {
-                isAssistantSpeakingRef.current = false;
-                flushRemainingBuffer();
-                speechEndTimeoutRef.current = null;
-            }, 500);
-        });
-    }, []);
-
-
-    return (
-        <>
-            <div
-                className={`transition-all duration-300 ${showDottedFace ? "h-0 overflow-hidden" : "h-auto"
-                    }`}
-            >
-                <VideoBox video={videoRef} audio={audioRef} />
-            </div>
-            <div className="flex flex-col items-center">
-                {!isAvatarVisible ? (
-                    <button
-                        onClick={handleStart}
-                        disabled={isLoading}
-                        className={cn(
-                            "w-full h-[52px] mt-4 disabled:bg-[#343434] disabled:text-white disabled:hover:rounded-[100px] bg-simliblue text-white py-3 px-6 rounded-[100px] transition-all duration-300 hover:text-black hover:bg-white hover:rounded-sm",
-                            "flex justify-center items-center"
-                        )}
-                    >
-                        {isLoading ? (
-                            <IconSparkleLoader className="h-[20px] animate-loader" />
-                        ) : (
-                            <span className="font-abc-repro-mono font-bold w-[164px]">
-                                Test Interaction
-                            </span>
-                        )}
-                    </button>
-                ) : (
-                    <>
-                        <div className="flex items-center gap-4 w-full">
-                            <button
-                                onClick={handleStop}
-                                className={cn(
-                                    "mt-4 group text-white flex-grow bg-red hover:rounded-sm hover:bg-white h-[52px] px-6 rounded-[100px] transition-all duration-300"
-                                )}
-                            >
-                                <span className="font-abc-repro-mono group-hover:text-black font-bold w-[164px] transition-all duration-300">
-                                    Stop Interaction
-                                </span>
-                            </button>
-                        </div>
-                    </>
-                )}
-            </div>
-        </>
-    );
+type Pipeline = {
+  ctx: AudioContext;
+  track: MediaStreamTrack;
+  // Keeps the remote WebRTC track flowing into Web Audio (Chrome needs the
+  // stream attached to a media element). Muted: only Simli's audio is heard.
+  sink: HTMLAudioElement;
 };
 
-export default SimliVapi;
+const toBytes = (a: Int16Array) => new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+
+function concat(parts: Int16Array[]): Int16Array {
+  let length = 0;
+  for (const p of parts) length += p.length;
+  const out = new Int16Array(length);
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
+}
+
+async function errorText(res: Response) {
+  try {
+    const j = await res.json();
+    return j.error ?? JSON.stringify(j);
+  } catch {
+    return res.statusText;
+  }
+}
+
+// Human-readable hints for common Simli failures.
+function explainSimliError(raw: string): string {
+  const m = raw.toUpperCase();
+  if (m.includes("401") || m.includes("UNAUTHORIZED")) return `${raw}: check SIMLI_API_KEY on the server.`;
+  if (m.includes("INVALID_FACE_ID")) return `${raw}: the face ID doesn't exist. Use a preset or copy it from the Simli dashboard.`;
+  if (m.includes("FACE_NOT_ALLOWED")) return `${raw}: that face belongs to another Simli account.`;
+  if (m.includes("422")) return `${raw}: invalid video framing (must be 1:1, 16:9 or 9:16, each side >= 512).`;
+  if (m.includes("429") || m.includes("RATE")) return `${raw}: too many Simli sessions running. Stop others or upgrade the plan.`;
+  if (m.includes("TOO MANY RETRY")) return `${raw}: the browser can't reach Simli's media servers (firewall or VPN?).`;
+  return raw;
+}
+
+// Vapi emits { type, error: { message, ... } } objects on "error".
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function explainVapiError(e: any): string {
+  const type: string = typeof e?.type === "string" ? e.type : "";
+  const inner = e?.error ?? e;
+  const detail: string =
+    inner?.message ?? inner?.errorMsg ?? inner?.error?.message ?? (typeof inner === "string" ? inner : JSON.stringify(inner));
+  if (type.startsWith("microphone-preflight")) return `Microphone unavailable or blocked (${detail}). Allow microphone access and try again.`;
+  const m = `${detail}`.toUpperCase();
+  if (m.includes("401") || m.includes("UNAUTHORIZED") || m.includes("INVALID KEY"))
+    return `Vapi: ${detail}. Check NEXT_PUBLIC_VAPI_PUBLIC_KEY (it must be the PUBLIC key).`;
+  if (m.includes("403")) return `Vapi: ${detail}. Check the public key's allowed origins and allowed assistants in the Vapi dashboard.`;
+  return `Vapi error${type ? ` (${type})` : ""}: ${detail}`;
+}
+
+export default function SimliVapi({ onStart, onClose }: { onStart: () => void; onClose: () => void }) {
+  const [status, setStatus] = useState<Status>("idle");
+  const [error, setError] = useState("");
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const simliRef = useRef<SimliClient | null>(null);
+  const vapiRef = useRef<Vapi | null>(null);
+  const pipelineRef = useRef<Pipeline | null>(null);
+  const trackPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Bumped whenever an interaction ends, so late callbacks from it are ignored.
+  const sessionRef = useRef(0);
+
+  // Gate / buffering state, only touched from audio callbacks and Vapi events.
+  const gateOpenRef = useRef(false);
+  const initialSentRef = useRef(false);
+  const pendingRef = useRef<Int16Array[]>([]);
+  const pendingLenRef = useRef(0);
+  const prerollRef = useRef<Int16Array[]>([]);
+  const prerollLenRef = useRef(0);
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  const resetBuffers = useCallback(() => {
+    if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = null;
+    gateOpenRef.current = false;
+    initialSentRef.current = false;
+    pendingRef.current = [];
+    pendingLenRef.current = 0;
+    prerollRef.current = [];
+    prerollLenRef.current = 0;
+  }, []);
+
+  const teardownPipeline = useCallback(() => {
+    if (trackPollRef.current) clearInterval(trackPollRef.current);
+    trackPollRef.current = null;
+    const p = pipelineRef.current;
+    pipelineRef.current = null;
+    if (p) {
+      p.sink.srcObject = null;
+      p.sink.remove();
+      void p.ctx.close().catch(() => {});
+    }
+  }, []);
+
+  /** Ends both sides. Idempotent: several events can report the same failure. */
+  const cleanup = useCallback(() => {
+    sessionRef.current += 1;
+    teardownPipeline();
+    resetBuffers();
+    const vapi = vapiRef.current;
+    vapiRef.current = null;
+    if (vapi) {
+      vapi.removeAllListeners();
+      void vapi.stop().catch(() => {});
+    }
+    const simli = simliRef.current;
+    simliRef.current = null;
+    if (simli) void simli.stop().catch(() => {});
+  }, [resetBuffers, teardownPipeline]);
+
+  /** Ends the interaction and returns the UI to its idle state. */
+  const end = useCallback(
+    (message?: string) => {
+      cleanup();
+      setStatus("idle");
+      setError(message ?? "");
+      onCloseRef.current();
+    },
+    [cleanup],
+  );
+
+  // --- Buffered forwarding to Simli ---------------------------------------
+
+  const takePending = (n: number): Int16Array => {
+    const all = concat(pendingRef.current);
+    const head = all.slice(0, n);
+    const rest = all.slice(n);
+    pendingRef.current = rest.length ? [rest] : [];
+    pendingLenRef.current = rest.length;
+    return head;
+  };
+
+  const forward = (samples: Int16Array) => {
+    const simli = simliRef.current;
+    if (!simli) return;
+
+    if (!gateOpenRef.current) {
+      // Assistant is quiet: keep only the most recent PREROLL_SAMPLES.
+      prerollRef.current.push(samples);
+      prerollLenRef.current += samples.length;
+      while (prerollLenRef.current - prerollRef.current[0].length >= PREROLL_SAMPLES) {
+        prerollLenRef.current -= prerollRef.current.shift()!.length;
+      }
+      return;
+    }
+
+    pendingRef.current.push(samples);
+    pendingLenRef.current += samples.length;
+
+    if (!initialSentRef.current) {
+      if (pendingLenRef.current < INITIAL_BUFFER_SAMPLES) return;
+      simli.sendAudioDataImmediate(toBytes(takePending(INITIAL_BUFFER_SAMPLES)));
+      initialSentRef.current = true;
+    }
+    while (pendingLenRef.current >= CHUNK_SAMPLES) {
+      simli.sendAudioData(toBytes(takePending(CHUNK_SAMPLES)));
+    }
+  };
+
+  const flush = () => {
+    const simli = simliRef.current;
+    if (simli && pendingLenRef.current > 0) {
+      const rest = takePending(pendingLenRef.current);
+      if (!initialSentRef.current) simli.sendAudioDataImmediate(toBytes(rest)); // utterance shorter than 1 s
+      else simli.sendAudioData(toBytes(rest));
+    }
+    pendingRef.current = [];
+    pendingLenRef.current = 0;
+  };
+
+  const onSpeechStart = () => {
+    if (closeTimerRef.current) {
+      clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+    if (gateOpenRef.current) return; // resumed within the grace window
+    gateOpenRef.current = true;
+    initialSentRef.current = false;
+    pendingRef.current = prerollRef.current;
+    pendingLenRef.current = prerollLenRef.current;
+    prerollRef.current = [];
+    prerollLenRef.current = 0;
+  };
+
+  const onSpeechEnd = () => {
+    if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = setTimeout(() => {
+      closeTimerRef.current = null;
+      gateOpenRef.current = false;
+      flush();
+    }, SPEECH_END_GRACE_MS);
+  };
+
+  const onUserInterrupted = () => {
+    // Drop what the avatar hasn't said yet, and what we haven't sent yet.
+    simliRef.current?.ClearBuffer();
+    pendingRef.current = [];
+    pendingLenRef.current = 0;
+    initialSentRef.current = false;
+  };
+
+  /** Taps the assistant's remote audio track and feeds it to Simli. */
+  const attachTrack = async (track: MediaStreamTrack) => {
+    if (pipelineRef.current?.track === track) return;
+    teardownPipeline(); // a renegotiated call can hand us a new track
+    resetBuffers();
+
+    const stream = new MediaStream([track]);
+    const sink = document.createElement("audio");
+    sink.muted = true;
+    sink.srcObject = stream;
+    void sink.play().catch(() => {});
+
+    const ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    pipelineRef.current = { ctx, track, sink };
+    const url = URL.createObjectURL(new Blob([TAP_WORKLET], { type: "application/javascript" }));
+    try {
+      await ctx.audioWorklet.addModule(url);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+    if (pipelineRef.current?.ctx !== ctx) return; // ended while loading
+    // No outputs: a pure sink, so nothing from Vapi reaches the speakers.
+    const node = new AudioWorkletNode(ctx, "vapi-tap", { numberOfInputs: 1, numberOfOutputs: 0 });
+    node.port.onmessage = (e: MessageEvent<Int16Array>) => forward(e.data);
+    ctx.createMediaStreamSource(stream).connect(node);
+    if (ctx.state === "suspended") await ctx.resume();
+  };
+
+  /** Fallback when Vapi's own player couldn't start: read the track from Daily. */
+  const pollDailyForTrack = (vapi: Vapi) => {
+    if (trackPollRef.current) return;
+    let tries = 0;
+    trackPollRef.current = setInterval(() => {
+      if (vapiRef.current !== vapi || pipelineRef.current) {
+        if (trackPollRef.current) clearInterval(trackPollRef.current);
+        trackPollRef.current = null;
+        return;
+      }
+      const participants = vapi.getDailyCallObject()?.participants();
+      const speaker = participants && Object.values(participants).find((p) => p.user_name === "Vapi Speaker");
+      const track = speaker?.tracks?.audio?.persistentTrack ?? speaker?.tracks?.audio?.track;
+      if (track) {
+        void attachTrack(track).catch((err) => end(`Could not route the assistant's audio to the avatar: ${err}`));
+      } else if (++tries > 100) {
+        end("Could not find the assistant's audio track.");
+      }
+    }, 100);
+  };
+
+  // --- Start / stop ---------------------------------------------------------
+
+  async function start() {
+    // Runs from a click, so the browser allows audio playback.
+    if (!VAPI_PUBLIC_KEY || !VAPI_ASSISTANT_ID) {
+      setError(
+        "Missing NEXT_PUBLIC_VAPI_PUBLIC_KEY or NEXT_PUBLIC_VAPI_ASSISTANT_ID. Copy .env.example to .env.local, fill them in and restart the dev server. (Older versions of this repo called them NEXT_PUBLIC_VAPI_API_KEY and NEXT_PUBLIC_VAPI_AGENT_ID.)",
+      );
+      return;
+    }
+    if (!videoRef.current || !audioRef.current) return;
+    setError("");
+    setStatus("starting");
+    onStart();
+    const session = ++sessionRef.current;
+
+    try {
+      // 1. Simli first: the avatar must be on screen before the assistant speaks.
+      const tokenRes = await fetch("/api/simli-token", { method: "POST" });
+      if (!tokenRes.ok) {
+        throw new Error(explainSimliError(`Simli token route failed (${tokenRes.status}): ${await errorText(tokenRes)}`));
+      }
+      const { session_token } = (await tokenRes.json()) as { session_token: string };
+
+      const simli = new SimliClient(session_token, videoRef.current, audioRef.current, null, LogLevel.ERROR);
+      simliRef.current = simli;
+      simli.on("error", (detail) => {
+        if (simliRef.current === simli) end(explainSimliError(`Simli error: ${detail}`));
+      });
+      simli.on("stop", () => {
+        // maxSessionLength / maxIdleTime reached, or the connection dropped.
+        if (simliRef.current === simli) end("The avatar session ended (session or idle time limit reached).");
+      });
+      simli.on("destination", (info) => console.info("Simli destination (session id):", info));
+      await simli.start(); // resolves when the first video frame is on screen
+      if (sessionRef.current !== session) return; // stopped while starting
+
+      // 2. Then Vapi. Its own playback is silenced; the avatar speaks instead.
+      const vapi = new Vapi(VAPI_PUBLIC_KEY);
+      vapiRef.current = vapi;
+      vapi.setVolume(0); // applied before Vapi's player starts, so it never plays audibly
+      vapi.on("audio", (player) => {
+        player.muted = true;
+        const track = (player.srcObject as MediaStream | null)?.getAudioTracks()[0];
+        if (track) void attachTrack(track).catch((err) => end(`Could not route the assistant's audio to the avatar: ${err}`));
+      });
+      vapi.on("speech-start", onSpeechStart);
+      vapi.on("speech-end", onSpeechEnd);
+      vapi.on("message", (msg) => {
+        if (msg?.type === "user-interrupted") onUserInterrupted();
+      });
+      vapi.on("call-end", () => {
+        if (vapiRef.current === vapi) end();
+      });
+      vapi.on("error", (e) => {
+        if (vapiRef.current !== vapi) return;
+        if (NON_FATAL_VAPI_ERRORS.has(e?.type)) {
+          console.warn("Vapi:", e);
+          if (e?.type === "audio-start-failed") pollDailyForTrack(vapi);
+          return;
+        }
+        end(explainVapiError(e));
+      });
+
+      const call = await vapi.start(VAPI_ASSISTANT_ID);
+      if (sessionRef.current !== session) return; // stopped while starting
+      if (!call) {
+        // start() resolves null on failure; the "error" handler normally reports why.
+        end("Vapi could not start the call. Check the assistant ID and public key.");
+        return;
+      }
+      setStatus("live");
+    } catch (e) {
+      // Ignore if this attempt was already ended (e.g. by Simli's "error" event, which
+      // fires for the same failure that rejects start()).
+      if (sessionRef.current === session) end(explainSimliError(e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // Stop everything on unmount and when the tab is closed, so sessions don't keep billing.
+  useEffect(() => {
+    const onHide = () => cleanup();
+    window.addEventListener("pagehide", onHide);
+    return () => {
+      window.removeEventListener("pagehide", onHide);
+      cleanup();
+    };
+  }, [cleanup]);
+
+  return (
+    <>
+      <div className={cn("transition-all duration-300", status === "idle" ? "h-0 overflow-hidden" : "h-auto")}>
+        <VideoBox video={videoRef} audio={audioRef} />
+      </div>
+      <div className="flex flex-col items-center">
+        {status !== "live" ? (
+          <button
+            onClick={start}
+            disabled={status === "starting"}
+            className={cn(
+              "w-full h-[52px] mt-4 cursor-pointer disabled:cursor-default disabled:bg-[#343434] disabled:text-white disabled:hover:rounded-[100px] bg-simliblue text-white py-3 px-6 rounded-[100px] transition-all duration-300 hover:text-black hover:bg-white hover:rounded-xs",
+              "flex justify-center items-center",
+            )}
+          >
+            {status === "starting" ? (
+              <IconSparkleLoader className="h-[20px] animate-loader" />
+            ) : (
+              <span className="font-abc-repro-mono font-bold w-[164px]">Test Interaction</span>
+            )}
+          </button>
+        ) : (
+          <div className="flex items-center gap-4 w-full">
+            <button
+              onClick={() => end()}
+              className="mt-4 group cursor-pointer text-white grow bg-red hover:rounded-xs hover:bg-white h-[52px] px-6 rounded-[100px] transition-all duration-300"
+            >
+              <span className="font-abc-repro-mono group-hover:text-black font-bold w-[164px] transition-all duration-300">
+                Stop Interaction
+              </span>
+            </button>
+          </div>
+        )}
+        {error && (
+          <p role="alert" className="mt-4 max-w-[350px] text-center text-red">
+            {error}
+          </p>
+        )}
+      </div>
+    </>
+  );
+}
